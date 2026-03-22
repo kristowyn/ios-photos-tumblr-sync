@@ -1,30 +1,28 @@
 """
 ios-photos-tumblr-sync
 
-Reads photos from a macOS Photos album, identifies food items using Claude Vision,
-and posts each photo to Tumblr backdated to the original EXIF capture date.
+Reads photos from a macOS Photos album and posts each photo to Tumblr
+backdated to the original EXIF capture date.
 """
 
-import base64
 import os
 import sys
 import time
 import tempfile
 from datetime import datetime, timezone
-from io import BytesIO
 from zoneinfo import ZoneInfo
 
-import anthropic
 import osxphotos
 import pytumblr
 from dotenv import load_dotenv
 from PIL import Image
+from pillow_heif import register_heif_opener
 from timezonefinder import TimezoneFinder
+
+register_heif_opener()  # enables Pillow to open HEIC/HEIF files
 
 LOG_FILE = "posted_photos.log"
 DELAY_SECONDS = 360  # 6 minutes — keeps under Tumblr's 250 posts/day limit
-MAX_IMAGE_PX = 1568  # Claude Vision optimal max dimension
-CLAUDE_MODEL = "claude-3-5-haiku-20241022"
 
 _tf = TimezoneFinder()
 
@@ -41,7 +39,6 @@ def load_environment() -> dict:
         "TUMBLR_OAUTH_TOKEN",
         "TUMBLR_OAUTH_SECRET",
         "TUMBLR_BLOG_NAME",
-        "ANTHROPIC_API_KEY",
         "PHOTOS_ALBUM_NAME",
     ]
     config = {}
@@ -120,74 +117,23 @@ def extract_metadata(photo) -> dict:
 
 
 def export_as_jpeg(photo, tmpdir: str) -> str | None:
-    exported = photo.export(
-        tmpdir,
-        use_photos_export=False,
-        convert_to_jpeg=True,
-        overwrite=True,
-    )
+    if photo.path is None:
+        # File is iCloud-only and not downloaded locally — cannot export without Photos.app
+        return None
+
+    exported = photo.export(tmpdir, use_photos_export=False, overwrite=True)
     if not exported:
         return None
-    return exported[0]
+    exported_path = exported[0]
 
+    # Convert HEIC/HEIF/DNG/WebP to JPEG (pillow-heif handles HEIC decode)
+    if not exported_path.lower().endswith((".jpg", ".jpeg")):
+        jpeg_path = os.path.splitext(exported_path)[0] + ".jpg"
+        with Image.open(exported_path) as img:
+            img.convert("RGB").save(jpeg_path, "JPEG", quality=95)
+        return jpeg_path
 
-# ---------------------------------------------------------------------------
-# Claude Vision
-# ---------------------------------------------------------------------------
-
-def encode_image_for_claude(jpeg_path: str) -> tuple[str, str]:
-    with Image.open(jpeg_path) as img:
-        img = img.convert("RGB")
-        w, h = img.size
-        if max(w, h) > MAX_IMAGE_PX:
-            ratio = MAX_IMAGE_PX / max(w, h)
-            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-        buf = BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        data = base64.b64encode(buf.getvalue()).decode()
-    return data, "image/jpeg"
-
-
-def detect_food_tags(client: anthropic.Anthropic, jpeg_path: str) -> list[str]:
-    try:
-        data, media_type = encode_image_for_claude(jpeg_path)
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=256,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": data,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "List the food items visible in this photo as a "
-                                "comma-separated list of single-word lowercase tags "
-                                "(e.g., pizza, sushi, ramen). If no food is visible, "
-                                "respond with exactly: none. Only output the tag list, "
-                                "nothing else."
-                            ),
-                        },
-                    ],
-                }
-            ],
-        )
-        raw = response.content[0].text.strip().lower()
-        if raw == "none" or not raw:
-            return []
-        tags = [t.strip().lstrip("#") for t in raw.split(",") if t.strip()]
-        return [t for t in tags if t and t != "none"]
-    except Exception as e:
-        print(f"  WARNING: Claude Vision failed ({e}), continuing without food tags.")
-        return []
+    return exported_path
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +155,8 @@ def build_caption(metadata: dict) -> str:
     return " | ".join(parts)
 
 
-def build_tags(food_tags: list[str]) -> list[str]:
-    return ["food"] + food_tags
+def build_tags() -> list[str]:
+    return ["food"]
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +208,21 @@ def post_to_tumblr(
         tags=tags,
         caption=caption,
         date=date_str,
-        data=jpeg_path,
+        data=[jpeg_path],  # pytumblr expects a list
     )
-    status = response.get("meta", {}).get("status", 0)
-    if status not in (200, 201):
+    # pytumblr returns either {meta: {status: 201}, response: {id: ...}}
+    # or directly {id: ..., state: published} depending on API version
+    if "errors" in response:
         raise RuntimeError(f"Tumblr API error: {response}")
-    return str(response.get("response", {}).get("id", "unknown"))
+    status = response.get("meta", {}).get("status", 0)
+    if status not in (0, 200, 201):  # 0 = no meta wrapper (direct response)
+        raise RuntimeError(f"Tumblr API error: {response}")
+    post_id = (
+        response.get("response", {}).get("id")
+        or response.get("id")
+        or "unknown"
+    )
+    return str(post_id)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +251,15 @@ def main():
         config["TUMBLR_OAUTH_TOKEN"],
         config["TUMBLR_OAUTH_SECRET"],
     )
-    anthropic_client = anthropic.Anthropic(api_key=config["ANTHROPIC_API_KEY"])
+
+    # Verify Tumblr credentials and blog name before processing any photos
+    blog_info = tumblr_client.blog_info(config["TUMBLR_BLOG_NAME"])
+    if "blog" not in blog_info:
+        print(f"ERROR: Could not access Tumblr blog '{config['TUMBLR_BLOG_NAME']}'.")
+        print(f"Response: {blog_info}")
+        print("Check TUMBLR_BLOG_NAME and your OAuth credentials in .env.")
+        sys.exit(1)
+    print(f"Tumblr blog verified: {blog_info['blog']['title']}\n")
 
     posts_this_run = 0
     for i, photo in enumerate(photos):
@@ -312,12 +275,14 @@ def main():
         with tempfile.TemporaryDirectory() as tmpdir:
             jpeg_path = export_as_jpeg(photo, tmpdir)
             if not jpeg_path:
-                print(f"  WARNING: Export failed for {photo.uuid}, skipping.")
+                if photo.path is None:
+                    print(f"  SKIP: Photo is iCloud-only (not downloaded to this Mac).")
+                else:
+                    print(f"  WARNING: Export failed for {photo.uuid}, skipping.")
                 continue
 
-            food_tags = detect_food_tags(anthropic_client, jpeg_path)
             caption = build_caption(metadata)
-            tags = build_tags(food_tags)
+            tags = build_tags()
             date_str = format_tumblr_date(metadata)
 
             print(f"  Date:    {date_str} (UTC)")
