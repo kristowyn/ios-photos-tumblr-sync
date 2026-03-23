@@ -31,7 +31,7 @@ except ImportError:
 
 register_heif_opener()  # enables Pillow to open HEIC/HEIF files
 
-LOG_FILE = "posted_photos.log"
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posted_photos.log")
 DELAY_SECONDS = 360  # 6 minutes — stays under Tumblr's 250 posts/day limit
 SUPPORTED_EXT = {".jpg", ".jpeg", ".heic", ".heif", ".png", ".webp", ".dng"}
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
