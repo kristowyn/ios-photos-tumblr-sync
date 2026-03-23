@@ -36,6 +36,7 @@ DELAY_SECONDS = 360  # 6 minutes — stays under Tumblr's 250 posts/day limit
 SUPPORTED_EXT = {".jpg", ".jpeg", ".heic", ".heif", ".png", ".webp", ".dng"}
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MAX_IMAGE_PX = 1568  # Claude Vision recommended max dimension
+TUMBLR_MAX_BYTES = 9 * 1024 * 1024  # 9 MB — Tumblr's 10 MB limit with headroom
 
 _tf = TimezoneFinder()
 
@@ -291,15 +292,49 @@ def format_tumblr_date(metadata: dict) -> str:
 # Tumblr
 # ---------------------------------------------------------------------------
 
+def _compress_for_tumblr(jpeg_path: str) -> str:
+    """Return jpeg_path as-is if under the size limit, else write a compressed
+    copy to a temp file and return that path instead."""
+    if os.path.getsize(jpeg_path) <= TUMBLR_MAX_BYTES:
+        return jpeg_path
+    with Image.open(jpeg_path) as img:
+        img = img.convert("RGB")
+        # Scale down progressively until it fits
+        for quality in (85, 75, 60, 45):
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            if buf.tell() <= TUMBLR_MAX_BYTES:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                tmp.write(buf.getvalue())
+                tmp.close()
+                print(f"  Compressed to {buf.tell() // (1024*1024)}MB (quality={quality})")
+                return tmp.name
+        # Last resort: also halve the dimensions
+        w, h = img.size
+        img = img.resize((w // 2, h // 2), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=60)
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp.write(buf.getvalue())
+        tmp.close()
+        print(f"  Compressed+resized to {buf.tell() // (1024*1024)}MB")
+        return tmp.name
+
+
 def post_to_tumblr(client, blog_name, jpeg_path, caption, tags, date_str) -> str:
+    upload_path = _compress_for_tumblr(jpeg_path)
     response = client.create_photo(
         blog_name,
         state="published",
         tags=tags,
         caption=caption,
         date=date_str,
-        data=[jpeg_path],
+        data=[upload_path],
     )
+    if upload_path != jpeg_path:
+        os.unlink(upload_path)  # clean up temp file
     if "errors" in response:
         raise RuntimeError(f"Tumblr API error: {response}")
     status = response.get("meta", {}).get("status", 0)
